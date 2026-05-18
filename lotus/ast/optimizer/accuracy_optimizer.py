@@ -32,8 +32,9 @@ import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Hashable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Hashable, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from lotus.types import CascadeArgs
@@ -145,28 +146,59 @@ class _ConstraintBuilder:
         return self._walk(nodes, ())
 
     def _walk(self, nodes: list[BaseNode], path: PathToLF) -> _InferResult:
+        logger.debug(
+            "AccuracyInferenceOptimizer: walking %d node(s) at path depth %d",
+            len(nodes),
+            len(path),
+        )
         current = _InferResult()
 
         for node_idx, node in enumerate(nodes):
             if isinstance(node, SourceNode):
                 # T-Table: <1, 1, 1>, identity element of the chain.
+                logger.debug(
+                    "AccuracyInferenceOptimizer: T-Table at idx=%d (path depth=%d) -> <1, 1, 1>",
+                    node_idx,
+                    len(path),
+                )
                 continue
 
             if isinstance(node, SemFilterNode):
                 # T-Sel
+                logger.debug(
+                    "AccuracyInferenceOptimizer: T-Sel for SemFilterNode at idx=%d (path depth=%d)",
+                    node_idx,
+                    len(path),
+                )
                 current = self._apply_t_sel(current, node_idx, path, label="sem_filter")
                 continue
 
             if isinstance(node, SemJoinNode):
                 # SemJoin = sigma_nu(q1 x q2): T-Prod followed by T-Sel.
+                logger.debug(
+                    "AccuracyInferenceOptimizer: SemJoinNode at idx=%d (path depth=%d) -> descending into right_lf",
+                    node_idx,
+                    len(path),
+                )
                 right = self._walk_right_lf(node, node_idx, path)
                 prod = self._apply_t_prod(current, right)
+                logger.debug(
+                    "AccuracyInferenceOptimizer: T-Sel for SemJoinNode predicate at idx=%d (path depth=%d)",
+                    node_idx,
+                    len(path),
+                )
                 current = self._apply_t_sel(prod, node_idx, path, label="sem_join")
                 continue
 
             if isinstance(node, (SemMapNode, SemExtractNode)):
                 # T-Proj-like: map/extract add or transform columns without
                 # filtering rows, so the row-level accuracy type is unchanged.
+                logger.debug(
+                    "AccuracyInferenceOptimizer: T-Proj for %s at idx=%d (path depth=%d) -> propagate",
+                    type(node).__name__,
+                    node_idx,
+                    len(path),
+                )
                 continue
 
 
@@ -185,6 +217,11 @@ class _ConstraintBuilder:
     ) -> _InferResult:
         right_lf = getattr(join_node, "right_lf", None)
         if right_lf is None or not hasattr(right_lf, "_nodes"):
+            logger.debug(
+                "AccuracyInferenceOptimizer: SemJoinNode at idx=%d has no right_lf, "
+                "treating right side as exact",
+                join_idx,
+            )
             return _InferResult()
         entry = PathEntry(node_idx=join_idx, field_name="right_lf")
         return self._walk(list(right_lf._nodes), parent_path + (entry,))
@@ -214,6 +251,17 @@ class _ConstraintBuilder:
         assignments = child.assignments + [
             _OpAssignment(node_idx=node_idx, path=path, pi=pi_op, rho=rho_op, p=p_op)
         ]
+        logger.debug(
+            "AccuracyInferenceOptimizer:   fresh op vars %s, %s, %s; "
+            "out vars %s, %s, %s; total ops so far: %d",
+            pi_op,
+            rho_op,
+            p_op,
+            pi_out,
+            rho_out,
+            p_out,
+            len(assignments),
+        )
 
         return _InferResult(
             pi=pi_out,
@@ -245,6 +293,14 @@ class _ConstraintBuilder:
         ]
         variables = left.variables + right.variables + [pi_out, rho_out, p_out]
         assignments = left.assignments + right.assignments
+        logger.debug(
+            "AccuracyInferenceOptimizer: T-Prod merging left/right -> out vars %s, %s, %s "
+            "(cumulative ops: %d)",
+            pi_out,
+            rho_out,
+            p_out,
+            len(assignments),
+        )
 
         return _InferResult(
             pi=pi_out,
@@ -279,64 +335,21 @@ def _budget_to_target(budget: float, min_epsilon: float) -> float:
     return min(1.0, max(min_epsilon, math.exp(-budget)))
 
 
-def _normalized_cost_weight(
-    key: Hashable,
-    keys: Sequence[Hashable],
-    cost_weights: Mapping[Hashable, float] | None,
-    cost_aware: bool,
-) -> float:
-    if not cost_aware or cost_weights is None:
-        return 1.0
-
-    positive_weights = [
-        float(cost_weights.get(k, 1.0))
-        for k in keys
-        if math.isfinite(float(cost_weights.get(k, 1.0)))
-        and float(cost_weights.get(k, 1.0)) > 0
-    ]
-    if not positive_weights:
-        return 1.0
-
-    min_positive = min(positive_weights)
-    raw_weight = float(cost_weights.get(key, 1.0))
-    if not math.isfinite(raw_weight) or raw_weight < 0:
-        raw_weight = 1.0
-    return max(raw_weight, min_positive * 1e-9) / min_positive
-
-
-def solve_cost_aware_product_targets(
+def _solve_uniform_z3(
     operator_keys: Sequence[Hashable],
     target_pi: float,
     target_rho: float,
     target_p: float,
     min_epsilon: float,
-    cost_weights: Mapping[Hashable, float] | None = None,
-    cost_aware: bool = True,
-) -> dict[Hashable, AccuracyTarget] | None:
-    """Solve product-rule per-operator targets with an optional cost objective.
+) -> Optional[dict[Hashable, AccuracyTarget]]:
+    """Allocate the product-rule budget equally across operators (cost-blind).
 
-    The Doc.pdf rules compose selection precision, recall, and success
-    probability multiplicatively. This helper solves the equivalent linear
-    problem in log-error-budget space:
-
-    ``sum(-log(pi_i)) <= -log(target_pi)`` and likewise for recall/probability.
-
-    When costs are provided, the optimizer assigns more error budget to more
-    expensive operators, which makes cheaper operators carry stricter accuracy
-    obligations and reduces expected fallback execution.
+    Used when no per-operator cost function is supplied. Each operator
+    receives the same combined error budget
+    ``(pi_i * rho_i * p_i) = (target_pi * target_rho * target_p) ** (1/N)``,
+    with a deterministic tiebreaker so the per-axis split is reproducible.
     """
     from z3 import Optimize, Real, RealVal, Sum, sat
-
-    if not 0.0 < min_epsilon < 1.0:
-        raise ValueError(f"min_epsilon must be in (0, 1), got {min_epsilon!r}")
-    if target_pi > 1.0 or target_rho > 1.0 or target_p > 1.0:
-        return None
-    if len(operator_keys) == 0:
-        return (
-            {}
-            if target_pi <= 1.0 and target_rho <= 1.0 and target_p <= 1.0
-            else None
-        )
 
     max_budget = -math.log(min_epsilon)
     optimizer = Optimize()
@@ -366,21 +379,7 @@ def solve_cost_aware_product_targets(
     combined_budgets = [
         budgets[k][0] + budgets[k][1] + budgets[k][2] for k in operator_keys
     ]
-    weighted_looseness = Sum(
-        [
-            _z3_float(
-                _normalized_cost_weight(
-                    key=key,
-                    keys=operator_keys,
-                    cost_weights=cost_weights,
-                    cost_aware=cost_aware,
-                )
-            )
-            * budget
-            for key, budget in zip(operator_keys, combined_budgets)
-        ]
-    )
-    optimizer.maximize(weighted_looseness)
+    optimizer.maximize(Sum(combined_budgets))
 
     if len(combined_budgets) > 1:
         spread = Real("accuracy_target_spread")
@@ -416,6 +415,168 @@ def solve_cost_aware_product_targets(
     }
 
 
+def _solve_with_cost_fn(
+    operator_keys: Sequence[Hashable],
+    target_pi: float,
+    target_rho: float,
+    target_p: float,
+    min_epsilon: float,
+    cost_fn: Callable[[Hashable, float, float, float], float],
+) -> Optional[dict[Hashable, AccuracyTarget]]:
+    """Minimize ``sum_i cost_fn(key_i, pi_i, rho_i, p_i)`` under product
+    constraints, via SLSQP in log-budget space.
+
+    Variables (per operator): ``b_pi_i, b_rho_i, b_p_i`` with
+    ``pi_i = exp(-b_pi_i)`` (and likewise for rho/p). Constraints are linear
+    in budgets: ``sum_i b_pi_i <= -log(target_pi)`` etc. with each
+    ``b_*_i in [0, -log(min_epsilon)]``.
+    """
+    from scipy.optimize import minimize
+
+    n = len(operator_keys)
+    max_budget = -math.log(min_epsilon)
+
+    def _target_log_budget(target: float) -> float:
+        if target <= 0.0:
+            return max_budget * n
+        return -math.log(float(min(1.0, target)))
+
+    log_pi = _target_log_budget(target_pi)
+    log_rho = _target_log_budget(target_rho)
+    log_p = _target_log_budget(target_p)
+
+    # Equal initial allocation per axis -- already feasible.
+    x0 = np.empty(3 * n, dtype=float)
+    x0[0::3] = log_pi / n
+    x0[1::3] = log_rho / n
+    x0[2::3] = log_p / n
+
+    bounds = [(0.0, max_budget)] * (3 * n)
+
+    def _objective(x: np.ndarray) -> float:
+        total = 0.0
+        for i, key in enumerate(operator_keys):
+            pi_i = _budget_to_target(float(x[3 * i]), min_epsilon)
+            rho_i = _budget_to_target(float(x[3 * i + 1]), min_epsilon)
+            p_i = _budget_to_target(float(x[3 * i + 2]), min_epsilon)
+            try:
+                c = float(cost_fn(key, pi_i, rho_i, p_i))
+            except Exception:
+                c = float("inf")
+            if not math.isfinite(c):
+                c = 1e12
+            total += c
+        return total
+
+    # Product-rule constraints translate to linear inequalities in log-budget
+    # space: ``-log(target) - sum(budgets) >= 0``. SciPy treats "ineq"
+    # constraints as ``fun(x) >= 0``.
+    constraints = [
+        {
+            "type": "ineq",
+            "fun": lambda x, axis=axis, cap=cap: cap
+            - float(np.sum(x[axis::3])),
+        }
+        for axis, cap in ((0, log_pi), (1, log_rho), (2, log_p))
+    ]
+
+    result = minimize(
+        _objective,
+        x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 200, "ftol": 1e-7, "disp": False},
+    )
+
+    if not result.success:
+        # The optimizer reached its iteration cap or got stuck on a constraint
+        # boundary. The starting point is already feasible (uniform split), so
+        # fall back to that rather than returning ``None``.
+        x_use = x0
+    else:
+        x_use = np.asarray(result.x, dtype=float)
+
+    # Numerical slack on the linear constraints: SLSQP can violate by ~1e-8
+    # which then propagates into ``pi*rho*p < target`` by a similar amount.
+    # Project back onto the feasible polytope along each axis if needed.
+    for axis, cap in ((0, log_pi), (1, log_rho), (2, log_p)):
+        s = float(np.sum(x_use[axis::3]))
+        if s > cap and s > 0.0:
+            x_use[axis::3] = x_use[axis::3] * (cap / s)
+
+    out: dict[Hashable, AccuracyTarget] = {}
+    for i, key in enumerate(operator_keys):
+        out[key] = AccuracyTarget(
+            pi=_budget_to_target(float(x_use[3 * i]), min_epsilon),
+            rho=_budget_to_target(float(x_use[3 * i + 1]), min_epsilon),
+            p=_budget_to_target(float(x_use[3 * i + 2]), min_epsilon),
+        )
+    return out
+
+
+def solve_cost_aware_product_targets(
+    operator_keys: Sequence[Hashable],
+    target_pi: float,
+    target_rho: float,
+    target_p: float,
+    min_epsilon: float,
+    *,
+    cost_fn: Optional[Callable[[Hashable, float, float, float], float]] = None,
+    cost_aware: bool = True,
+) -> Optional[dict[Hashable, AccuracyTarget]]:
+    """Solve per-operator product-rule accuracy targets.
+
+    Implements the cost rule from Fig. 2 of Lesani, *Accuracy Specification
+    and Derivation for Natural Language Relational Algebra* (Jan 2026):
+
+        minimize   sum_i cost_op_i(pi_i, rho_i, p_i)
+        subject to product_i pi_i  >= target_pi
+                   product_i rho_i >= target_rho
+                   product_i p_i   >= target_p
+                   pi_i, rho_i, p_i in [min_epsilon, 1]
+
+    The product constraints are linearized in log-budget space (Sum of
+    ``-log(pi_i)`` <= ``-log(target_pi)``, etc.) and the per-operator cost
+    is supplied by ``cost_fn(key, pi, rho, p) -> float``. ``cost_fn`` is
+    free to depend non-linearly on ``(pi, rho, p)``; common Stretto cost
+    models (e.g. ``c_proxy*n + c_silver*n*UnsureFraction(pi, rho)``) fit
+    naturally.
+
+    When ``cost_fn`` is ``None`` or ``cost_aware=False``, the allocation
+    falls back to an equal-split-per-axis uniform Z3 solve, useful as a
+    cost-blind baseline.
+    """
+    if not 0.0 < min_epsilon < 1.0:
+        raise ValueError(f"min_epsilon must be in (0, 1), got {min_epsilon!r}")
+    if target_pi > 1.0 or target_rho > 1.0 or target_p > 1.0:
+        return None
+    if len(operator_keys) == 0:
+        return (
+            {}
+            if target_pi <= 1.0 and target_rho <= 1.0 and target_p <= 1.0
+            else None
+        )
+
+    if not cost_aware or cost_fn is None:
+        return _solve_uniform_z3(
+            operator_keys=operator_keys,
+            target_pi=target_pi,
+            target_rho=target_rho,
+            target_p=target_p,
+            min_epsilon=min_epsilon,
+        )
+
+    return _solve_with_cost_fn(
+        operator_keys=operator_keys,
+        target_pi=target_pi,
+        target_rho=target_rho,
+        target_p=target_p,
+        min_epsilon=min_epsilon,
+        cost_fn=cost_fn,
+    )
+
+
 def _solve(
     result: _InferResult,
     target_pi: float,
@@ -435,7 +596,7 @@ def _solve(
         target_rho=target_rho,
         target_p=target_p,
         min_epsilon=min_epsilon,
-        cost_weights=None,
+        cost_fn=None,
         cost_aware=False,
     )
     if targets is None:
@@ -524,6 +685,15 @@ class AccuracyInferenceOptimizer(BaseOptimizer):
                 "Install it with: pip install z3-solver"
             ) from exc
 
+        logger.info(
+            "AccuracyInferenceOptimizer: starting on %d top-level node(s) with "
+            "targets pi=%.4f, rho=%.4f, p=%.4f, min_epsilon=%.4f",
+            len(nodes),
+            self.precision_target,
+            self.recall_target,
+            self.probability_target,
+            self.min_epsilon,
+        )
         builder = _ConstraintBuilder()
         result = builder.walk(nodes)
 
@@ -531,6 +701,12 @@ class AccuracyInferenceOptimizer(BaseOptimizer):
             logger.info("AccuracyInferenceOptimizer: no semantic operators found")
             return nodes
 
+        logger.info(
+            "AccuracyInferenceOptimizer: collected %d operator(s) and %d constraint(s); "
+            "invoking Z3",
+            len(result.assignments),
+            len(result.constraints),
+        )
         solved = _solve(
             result,
             self.precision_target,
