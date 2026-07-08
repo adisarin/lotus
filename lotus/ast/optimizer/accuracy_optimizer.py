@@ -497,6 +497,22 @@ def _solve_with_cost_fn(
     else:
         x_use = np.asarray(result.x, dtype=float)
 
+    # F7: the EE cost objective is piecewise-constant (discrete thresholds + min
+    # over layers), so SLSQP often gets ~0 gradient and either fails (falls back
+    # to x0) or returns a point ~= x0 -- i.e. the "cost-aware" split silently
+    # degenerates to the uniform/geometric one. Log it so a reader knows when the
+    # allocation is actually uniform (not a bug: the guarantee still holds).
+    import logging as _logging
+
+    _is_uniform = bool(np.allclose(x_use, np.asarray(x0, dtype=float), atol=1e-9))
+    _logging.getLogger(__name__).info(
+        "accuracy SLSQP split: success=%s status=%s cost_aware_split_converged=%s "
+        "(returned point %s uniform x0)",
+        bool(result.success), getattr(result, "status", "?"),
+        bool(result.success) and not _is_uniform,
+        "==" if _is_uniform else "!=",
+    )
+
     # Numerical slack on the linear constraints: SLSQP can violate by ~1e-8
     # which then propagates into ``pi*rho*p < target`` by a similar amount.
     # Project back onto the feasible polytope along each axis if needed.
