@@ -32,7 +32,15 @@ import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Hashable, Optional, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Hashable,
+    Mapping,
+    Optional,
+    Sequence,
+)
 
 import numpy as np
 import pandas as pd
@@ -422,6 +430,9 @@ def _solve_with_cost_fn(
     target_p: float,
     min_epsilon: float,
     cost_fn: Callable[[Hashable, float, float, float], float],
+    *,
+    trace_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    trace_context: Optional[Mapping[str, Any]] = None,
 ) -> Optional[dict[Hashable, AccuracyTarget]]:
     """Minimize ``sum_i cost_fn(key_i, pi_i, rho_i, p_i)`` under product
     constraints, via SLSQP in log-budget space.
@@ -453,19 +464,171 @@ def _solve_with_cost_fn(
 
     bounds = [(0.0, max_budget)] * (3 * n)
 
-    def _objective(x: np.ndarray) -> float:
+    trace_sequence = 0
+    objective_evaluation = 0
+    accepted_iteration = 0
+    trace_failed = False
+    evaluation_cache: dict[
+        bytes, tuple[int, float, list[float], list[Optional[str]]]
+    ] = {}
+
+    def _key_for_x(x: np.ndarray) -> bytes:
+        return np.ascontiguousarray(np.asarray(x, dtype=np.float64)).tobytes()
+
+    def _targets_for_x(x: np.ndarray) -> list[dict[str, Any]]:
+        targets = []
+        for i, key in enumerate(operator_keys):
+            p_i = _budget_to_target(float(x[3 * i + 2]), min_epsilon)
+            targets.append(
+                {
+                    "operator_index": i,
+                    # Operator keys in current callers are tuples/ints/strings.
+                    # ``repr`` keeps the generic Hashable API traceable even for
+                    # a caller-defined key that is not JSON serializable.
+                    "operator_key_repr": repr(key),
+                    "precision_target": _budget_to_target(
+                        float(x[3 * i]), min_epsilon
+                    ),
+                    "recall_target": _budget_to_target(
+                        float(x[3 * i + 1]), min_epsilon
+                    ),
+                    "probability_target": p_i,
+                    "estimation_confidence": min(max(p_i, 1e-9), 1.0 - 1e-9),
+                }
+            )
+        return targets
+
+    def _constraints_for_targets(
+        x: np.ndarray, targets: Sequence[Mapping[str, Any]]
+    ) -> dict[str, dict[str, float | bool]]:
+        output: dict[str, dict[str, float | bool]] = {}
+        for name, axis, cap, required, field_name in (
+            ("precision", 0, log_pi, target_pi, "precision_target"),
+            ("recall", 1, log_rho, target_rho, "recall_target"),
+            ("probability", 2, log_p, target_p, "probability_target"),
+        ):
+            used = float(np.sum(x[axis::3]))
+            product = float(math.prod(float(row[field_name]) for row in targets))
+            log_slack = float(cap - used)
+            product_slack = float(product - required)
+            output[name] = {
+                "required_product": float(required),
+                "assigned_product": product,
+                "product_slack": product_slack,
+                "log_budget_cap": float(cap),
+                "log_budget_used": used,
+                "log_budget_slack": log_slack,
+                "feasible": bool(log_slack >= -1e-7),
+            }
+        return output
+
+    def _emit_trace(
+        event: str,
+        x: np.ndarray,
+        *,
+        objective: Optional[float] = None,
+        costs: Optional[Sequence[float]] = None,
+        cost_errors: Optional[Sequence[Optional[str]]] = None,
+        **fields: Any,
+    ) -> None:
+        nonlocal trace_sequence, trace_failed
+        if trace_callback is None or trace_failed:
+            return
+        targets = _targets_for_x(x)
+        if costs is not None:
+            for row, cost, error in zip(
+                targets, costs, cost_errors or [None] * len(costs)
+            ):
+                row["objective_cost"] = float(cost)
+                row["cost_error"] = error
+        record: dict[str, Any] = {
+            "schema": "lotus.accuracy-slsqp-trace.v1",
+            "event": event,
+            "event_sequence": trace_sequence,
+            "context": dict(trace_context or {}),
+            "global_targets": {
+                "precision": float(target_pi),
+                "recall": float(target_rho),
+                "probability": float(target_p),
+            },
+            "operators": targets,
+            "objective": None if objective is None else float(objective),
+            "constraints": _constraints_for_targets(x, targets),
+            "log_budgets": [float(value) for value in np.asarray(x, dtype=float)],
+            **fields,
+        }
+        trace_sequence += 1
+        try:
+            trace_callback(record)
+        except Exception:  # pragma: no cover - defensive: tracing is observational
+            # Instrumentation must never change the optimizer's selected point.
+            # Disable the failed sink for the remainder of this solve and leave a
+            # conventional log record for diagnosis.
+            trace_failed = True
+            logger.exception("Disabling failed accuracy-SLSQP trace callback")
+
+    def _evaluate_costs(
+        x: np.ndarray,
+    ) -> tuple[float, list[float], list[Optional[str]]]:
         total = 0.0
+        costs: list[float] = []
+        cost_errors: list[Optional[str]] = []
         for i, key in enumerate(operator_keys):
             pi_i = _budget_to_target(float(x[3 * i]), min_epsilon)
             rho_i = _budget_to_target(float(x[3 * i + 1]), min_epsilon)
             p_i = _budget_to_target(float(x[3 * i + 2]), min_epsilon)
+            error: Optional[str] = None
             try:
                 c = float(cost_fn(key, pi_i, rho_i, p_i))
-            except Exception:
+            except Exception as exc:
                 c = float("inf")
+                error = f"{type(exc).__name__}: {exc}"
             if not math.isfinite(c):
                 c = 1e12
+                if error is None:
+                    error = "non-finite cost mapped to 1e12"
+            costs.append(c)
+            cost_errors.append(error)
             total += c
+        return total, costs, cost_errors
+
+    def _objective(x: np.ndarray) -> float:
+        nonlocal objective_evaluation
+        if trace_callback is None:
+            # Preserve the pre-instrumentation hot path: no target-record/list
+            # construction when tracing was not explicitly requested.
+            total = 0.0
+            for i, key in enumerate(operator_keys):
+                pi_i = _budget_to_target(float(x[3 * i]), min_epsilon)
+                rho_i = _budget_to_target(float(x[3 * i + 1]), min_epsilon)
+                p_i = _budget_to_target(float(x[3 * i + 2]), min_epsilon)
+                try:
+                    cost = float(cost_fn(key, pi_i, rho_i, p_i))
+                except Exception:
+                    cost = float("inf")
+                if not math.isfinite(cost):
+                    cost = 1e12
+                total += cost
+            return total
+
+        total, costs, cost_errors = _evaluate_costs(x)
+        evaluation_index = objective_evaluation
+        objective_evaluation += 1
+        if trace_callback is not None:
+            evaluation_cache[_key_for_x(x)] = (
+                evaluation_index,
+                total,
+                costs,
+                cost_errors,
+            )
+        _emit_trace(
+            "objective_evaluation",
+            x,
+            objective=total,
+            costs=costs,
+            cost_errors=cost_errors,
+            objective_evaluation=evaluation_index,
+        )
         return total
 
     # Product-rule constraints translate to linear inequalities in log-budget
@@ -480,12 +643,40 @@ def _solve_with_cost_fn(
         for axis, cap in ((0, log_pi), (1, log_rho), (2, log_p))
     ]
 
+    _emit_trace(
+        "solver_start",
+        x0,
+        accepted_iteration=0,
+        max_iterations=200,
+        ftol=1e-7,
+    )
+
+    def _iteration_callback(xk: np.ndarray) -> None:
+        nonlocal accepted_iteration
+        accepted_iteration += 1
+        cached = evaluation_cache.get(_key_for_x(xk))
+        if cached is None:
+            total, costs, cost_errors = _evaluate_costs(xk)
+            source_evaluation = None
+        else:
+            source_evaluation, total, costs, cost_errors = cached
+        _emit_trace(
+            "accepted_iteration",
+            xk,
+            objective=total,
+            costs=costs,
+            cost_errors=cost_errors,
+            accepted_iteration=accepted_iteration,
+            source_objective_evaluation=source_evaluation,
+        )
+
     result = minimize(
         _objective,
         x0,
         method="SLSQP",
         bounds=bounds,
         constraints=constraints,
+        callback=_iteration_callback if trace_callback is not None else None,
         options={"maxiter": 200, "ftol": 1e-7, "disp": False},
     )
 
@@ -493,9 +684,11 @@ def _solve_with_cost_fn(
         # The optimizer reached its iteration cap or got stuck on a constraint
         # boundary. The starting point is already feasible (uniform split), so
         # fall back to that rather than returning ``None``.
-        x_use = x0
+        x_use = np.asarray(x0, dtype=float).copy()
+        selected_point_source = "uniform_fallback"
     else:
-        x_use = np.asarray(result.x, dtype=float)
+        x_use = np.asarray(result.x, dtype=float).copy()
+        selected_point_source = "solver_result"
 
     # F7: the EE cost objective is piecewise-constant (discrete thresholds + min
     # over layers), so SLSQP often gets ~0 gradient and either fails (falls back
@@ -504,7 +697,9 @@ def _solve_with_cost_fn(
     # allocation is actually uniform (not a bug: the guarantee still holds).
     import logging as _logging
 
-    _is_uniform = bool(np.allclose(x_use, np.asarray(x0, dtype=float), atol=1e-9))
+    _is_uniform = bool(
+        np.allclose(x_use, np.asarray(x0, dtype=float), rtol=0.0, atol=1e-9)
+    )
     _logging.getLogger(__name__).info(
         "accuracy SLSQP split: success=%s status=%s cost_aware_split_converged=%s "
         "(returned point %s uniform x0)",
@@ -516,10 +711,50 @@ def _solve_with_cost_fn(
     # Numerical slack on the linear constraints: SLSQP can violate by ~1e-8
     # which then propagates into ``pi*rho*p < target`` by a similar amount.
     # Project back onto the feasible polytope along each axis if needed.
+    x_before_projection = x_use.copy()
     for axis, cap in ((0, log_pi), (1, log_rho), (2, log_p)):
         s = float(np.sum(x_use[axis::3]))
         if s > cap and s > 0.0:
             x_use[axis::3] = x_use[axis::3] * (cap / s)
+
+    if trace_callback is not None:
+        final_objective, final_costs, final_cost_errors = _evaluate_costs(x_use)
+        scipy_fun = getattr(result, "fun", None)
+        scipy_reported_objective = (
+            float(scipy_fun)
+            if scipy_fun is not None and math.isfinite(float(scipy_fun))
+            else None
+        )
+        _emit_trace(
+            "solver_result",
+            x_use,
+            objective=final_objective,
+            costs=final_costs,
+            cost_errors=final_cost_errors,
+            success=bool(result.success),
+            status=int(getattr(result, "status", -1)),
+            message=str(getattr(result, "message", "")),
+            iterations=int(getattr(result, "nit", accepted_iteration)),
+            objective_evaluations=int(
+                getattr(result, "nfev", objective_evaluation)
+            ),
+            jacobian_evaluations=(
+                None
+                if getattr(result, "njev", None) is None
+                else int(getattr(result, "njev"))
+            ),
+            selected_point_source=selected_point_source,
+            returned_uniform=bool(
+                np.allclose(x_use, x0, rtol=0.0, atol=1e-9)
+            ),
+            projection_applied=bool(
+                not np.allclose(x_use, x_before_projection, rtol=0.0, atol=0.0)
+            ),
+            projection_max_abs_delta=float(
+                np.max(np.abs(x_use - x_before_projection))
+            ),
+            scipy_reported_objective=scipy_reported_objective,
+        )
 
     out: dict[Hashable, AccuracyTarget] = {}
     for i, key in enumerate(operator_keys):
@@ -540,6 +775,8 @@ def solve_cost_aware_product_targets(
     *,
     cost_fn: Optional[Callable[[Hashable, float, float, float], float]] = None,
     cost_aware: bool = True,
+    trace_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    trace_context: Optional[Mapping[str, Any]] = None,
 ) -> Optional[dict[Hashable, AccuracyTarget]]:
     """Solve per-operator product-rule accuracy targets.
 
@@ -561,7 +798,11 @@ def solve_cost_aware_product_targets(
 
     When ``cost_fn`` is ``None`` or ``cost_aware=False``, the allocation
     falls back to an equal-split-per-axis uniform Z3 solve, useful as a
-    cost-blind baseline.
+    cost-blind baseline. When ``trace_callback`` is supplied, cost-aware solves
+    emit a JSON-compatible record for the initial point, every objective
+    evaluation, every SLSQP callback iteration, and the final selected point.
+    ``trace_context`` is copied into every record so a caller can attach stable
+    run/query identities without coupling this generic solver to its runner.
     """
     if not 0.0 < min_epsilon < 1.0:
         raise ValueError(f"min_epsilon must be in (0, 1), got {min_epsilon!r}")
@@ -590,6 +831,8 @@ def solve_cost_aware_product_targets(
         target_p=target_p,
         min_epsilon=min_epsilon,
         cost_fn=cost_fn,
+        trace_callback=trace_callback,
+        trace_context=trace_context,
     )
 
 
