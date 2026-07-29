@@ -1,205 +1,939 @@
+"""Accuracy inference optimizer for LOTUS LazyFrames.
+
+Implements the type inference system from Mohsen Lesani, *Accuracy
+Specification and Derivation for Natural Language Relational Algebra*
+(Jan 2026, Fig. 2). Given a top-level precision (pi), recall (rho), and
+probability (p) target for the whole pipeline, the optimizer walks the AST,
+emits the constraints implied by the typing rules, and solves them with Z3
+to derive a feasible per-operator (pi, rho, p) assignment. Each
+``SemFilterNode`` / ``SemJoinNode`` is then rewritten with a fresh
+``CascadeArgs`` carrying its share of the accuracy obligation.
+
+Supported rules: T-Table, T-Var, T-Prod (cross product underlying joins),
+T-Sel (filter / join predicate), T-Proj (map / extract). Union (T-Union)
+and difference (T-Minus) are intentionally out of scope for now.
+
+The traversal mirrors :class:`GEPAOptimizer` — a recursive ``_walk`` over
+nodes plus nested LazyFrames addressed by :class:`PathEntry`, and a
+matching ``_apply_at_path`` rewrite that reconstructs parent ``LazyFrame``
+nodes from the deepest path upward. This means operators nested inside a
+``SemJoinNode.right_lf`` are both constraint-tracked and rewritten in
+place.
+
+The optimizer requires ``z3-solver``; the import is lazy so the module can
+be imported without it::
+
+    pip install z3-solver
+"""
+
 from __future__ import annotations
+
 import logging
-from typing import Any
-from z3 import Real, Solver, sat, If
+import math
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Hashable,
+    Mapping,
+    Optional,
+    Sequence,
+)
+
+import numpy as np
+import pandas as pd
+
+from lotus.types import CascadeArgs
+
+from ..nodes import (
+    BaseNode,
+    PandasFilterNode,
+    SemExtractNode,
+    SemFilterNode,
+    SemJoinNode,
+    SemMapNode,
+    SourceNode,
+)
+from .base import BaseOptimizer
+from .utils import PathEntry, PathToLF, rewrite_by_path
+
+if TYPE_CHECKING:
+    from ..lazyframe import LazyFrame
+
 logger = logging.getLogger(__name__)
 
-try:
-    import pandas as pd
-    from lotus.ast.nodes import (
-        BaseNode,
-        SemFilterNode,
-        SemJoinNode,
-        SemMapNode,
-        SemExtractNode,
-        SourceNode,
-        PandasFilterNode,
-    )
-    from lotus.ast.optimizer.base import BaseOptimizer
-    from lotus.types import CascadeArgs
 
-    LOTUS_AVAILABLE = True
-except ImportError:
-    import pandas as pd
-    class BaseNode:
-        pass
+# T-Table base case: an exact source has pi = rho = p = 1.
+_EXACT: float = 1.0
 
-    class SemFilterNode(BaseNode):
-        user_instruction: str = ""
-        cascade_args = None
-        def model_copy(self, **kw):
-            return self
 
-    class SemJoinNode(BaseNode):
-        join_instruction: str = ""
-        cascade_args = None
-        right_lf = None
-        def model_copy(self, **kw):
-            return self
+@dataclass(frozen=True, slots=True)
+class AccuracyTarget:
+    """Solved per-operator accuracy obligation."""
 
-    class SemMapNode(BaseNode):
-        pass
+    pi: float
+    rho: float
+    p: float
 
-    class SemExtractNode(BaseNode):
-        pass
 
-    class SourceNode(BaseNode):
-        pass
+# ---------------------------------------------------------------------------
+# Per-operator assignment record
+# ---------------------------------------------------------------------------
 
-    class PandasFilterNode(BaseNode):
-        pass
 
-    class BaseOptimizer:
-        requires_train_data: bool = False
+@dataclass(frozen=True, slots=True)
+class _OpAssignment:
+    """Where to write back a solved (pi, rho, p) for one operator.
 
-    class CascadeArgs:
-        def __init__(self, **kw):
-            for k, v in kw.items():
-                setattr(self, k, v)
-        def model_copy(self, update=None):
-            return self
+    ``path`` is the ``PathToLF`` from the root LazyFrame down to the list
+    containing the node; ``node_idx`` indexes into that list. ``pi``/``rho``
+    /``p`` are Z3 ``Real`` symbols that the solver assigns concrete values
+    to.
+    """
 
-    LOTUS_AVAILABLE = False
+    node_idx: int
+    path: PathToLF
+    pi: Any
+    rho: Any
+    p: Any
 
+
+# ---------------------------------------------------------------------------
+# Inference state
+# ---------------------------------------------------------------------------
+
+
+@dataclass
 class _InferResult:
-    __slots__ = ("pi", "rho", "p", "constraints", "variables", "op_map")
+    """Accumulated state of the type inference traversal.
 
-    def __init__(self, pi, rho, p, constraints=None, variables=None, op_map=None):
-        self.pi = pi
-        self.rho = rho
-        self.p = p
-        self.constraints = constraints or []
-        self.variables = variables or []
-        self.op_map = op_map or {}
+    Mirrors the judgement ``Gamma |- q : <pi, rho, p>, c, C`` from the paper
+    (cost ``c`` is not yet modeled). ``pi``/``rho``/``p`` are either Z3
+    ``Real`` symbols or float constants representing the current accuracy
+    type. ``constraints`` is the constraint set ``C``. ``variables`` lists
+    every fresh ``Real`` we introduced so the solver can bound them.
+    ``assignments`` records each per-operator triple together with its
+    location for later rewriting.
+    """
+
+    pi: Any = _EXACT
+    rho: Any = _EXACT
+    p: Any = _EXACT
+    constraints: list[Any] = field(default_factory=list)
+    variables: list[Any] = field(default_factory=list)
+    assignments: list[_OpAssignment] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Constraint builder
+# ---------------------------------------------------------------------------
+
 
 class _ConstraintBuilder:
+    """Walks a LOTUS AST and emits the inference judgement constraints.
 
-    def __init__(self):
-        self._id = 0
+    Each branch of ``_walk`` corresponds to a typing rule in Fig. 2 of the
+    paper. Recursion into ``SemJoinNode.right_lf`` happens via ``PathEntry``
+    just like in :class:`GEPAOptimizer`.
+    """
 
-    def _fresh(self, base: str) -> Real:
-        self._id += 1
-        return Real(f"{base}_{self._id}")
+    def __init__(self) -> None:
+        # Lazy: only construct the builder once z3 is available.
+        from z3 import Real
 
-    def traverse(self, nodes: list) -> _InferResult:
-        current = _InferResult(pi=1.0, rho=1.0, p=1.0)
+        self._Real = Real
+        self._counter = 0
 
-        for idx, node in enumerate(nodes):
+    def _fresh(self, base: str) -> Any:
+        self._counter += 1
+        return self._Real(f"{base}_{self._counter}")
+
+    def walk(self, nodes: list[BaseNode]) -> _InferResult:
+        return self._walk(nodes, ())
+
+    def _walk(self, nodes: list[BaseNode], path: PathToLF) -> _InferResult:
+        logger.debug(
+            "AccuracyInferenceOptimizer: walking %d node(s) at path depth %d",
+            len(nodes),
+            len(path),
+        )
+        current = _InferResult()
+
+        for node_idx, node in enumerate(nodes):
             if isinstance(node, SourceNode):
+                # T-Table: <1, 1, 1>, identity element of the chain.
+                logger.debug(
+                    "AccuracyInferenceOptimizer: T-Table at idx=%d (path depth=%d) -> <1, 1, 1>",
+                    node_idx,
+                    len(path),
+                )
                 continue
 
-            elif isinstance(node, SemFilterNode):
-                current = self._apply_t_sel(current, idx, 
-                    label=f"sem_filter")
-
-            elif isinstance(node, SemJoinNode):
-                right_result = self._traverse_right_side(node)
-                prod_result = self._apply_t_prod(current, right_result)
-                current = self._apply_t_sel(prod_result, idx,
-                    label=f"sem_join")
-
-            elif isinstance(node, (SemMapNode, SemExtractNode)):
+            if isinstance(node, SemFilterNode):
+                # T-Sel
+                logger.debug(
+                    "AccuracyInferenceOptimizer: T-Sel for SemFilterNode at idx=%d (path depth=%d)",
+                    node_idx,
+                    len(path),
+                )
+                current = self._apply_t_sel(current, node_idx, path, label="sem_filter")
                 continue
 
-            elif isinstance(node, PandasFilterNode):
+            if isinstance(node, SemJoinNode):
+                # SemJoin = sigma_nu(q1 x q2): T-Prod followed by T-Sel.
+                logger.debug(
+                    "AccuracyInferenceOptimizer: SemJoinNode at idx=%d (path depth=%d) -> descending into right_lf",
+                    node_idx,
+                    len(path),
+                )
+                right = self._walk_right_lf(node, node_idx, path)
+                prod = self._apply_t_prod(current, right)
+                logger.debug(
+                    "AccuracyInferenceOptimizer: T-Sel for SemJoinNode predicate at idx=%d (path depth=%d)",
+                    node_idx,
+                    len(path),
+                )
+                current = self._apply_t_sel(prod, node_idx, path, label="sem_join")
                 continue
 
-            else:
+            if isinstance(node, (SemMapNode, SemExtractNode)):
+                # T-Proj-like: map/extract add or transform columns without
+                # filtering rows, so the row-level accuracy type is unchanged.
+                logger.debug(
+                    "AccuracyInferenceOptimizer: T-Proj for %s at idx=%d (path depth=%d) -> propagate",
+                    type(node).__name__,
+                    node_idx,
+                    len(path),
+                )
                 continue
+
+
+            logger.debug(
+                "AccuracyInferenceOptimizer: skipping unsupported/irrelevant node %s",
+                type(node).__name__,
+            )
 
         return current
 
-    def _traverse_right_side(self, join_node) -> _InferResult:
-        right_lf = getattr(join_node, 'right_lf', None)
+    def _walk_right_lf(
+        self,
+        join_node: SemJoinNode,
+        join_idx: int,
+        parent_path: PathToLF,
+    ) -> _InferResult:
+        right_lf = getattr(join_node, "right_lf", None)
+        if right_lf is None or not hasattr(right_lf, "_nodes"):
+            logger.debug(
+                "AccuracyInferenceOptimizer: SemJoinNode at idx=%d has no right_lf, "
+                "treating right side as exact",
+                join_idx,
+            )
+            return _InferResult()
+        entry = PathEntry(node_idx=join_idx, field_name="right_lf")
+        return self._walk(list(right_lf._nodes), parent_path + (entry,))
 
-        if right_lf is not None and hasattr(right_lf, '_nodes'):
-            return self.traverse(right_lf._nodes)
-        else:
-            return _InferResult(pi=1.0, rho=1.0, p=1.0)
+    def _apply_t_sel(
+        self,
+        child: _InferResult,
+        node_idx: int,
+        path: PathToLF,
+        label: str,
+    ) -> _InferResult:
+        """T-Sel: <pi1, rho1, p1> -> <pi1*pi, rho1*rho, p1*p> with fresh pi, rho, p."""
+        pi_op = self._fresh(f"pi_{label}")
+        rho_op = self._fresh(f"rho_{label}")
+        p_op = self._fresh(f"p_{label}")
 
-    def _apply_t_sel(self, child: _InferResult, node_idx: int, label: str = "sel") -> _InferResult:
-        piOp = self._fresh(f"pi_{label}")
-        rhoOp = self._fresh(f"rho_{label}")
-        pOp = self._fresh(f"p_{label}")
+        pi_out = self._fresh("pi_out")
+        rho_out = self._fresh("rho_out")
+        p_out = self._fresh("p_out")
 
-        piOut = self._fresh("pi_out")
-        rhoOut = self._fresh("rho_out")
-        pOut = self._fresh("p_out")
-
-        new_constraints = child.constraints + [
-            piOut == child.pi * piOp,
-            rhoOut == child.rho * rhoOp,
-            pOut == child.p * pOp,
+        constraints = child.constraints + [
+            pi_out == child.pi * pi_op,
+            rho_out == child.rho * rho_op,
+            p_out == child.p * p_op,
         ]
-
-        new_vars = child.variables + [piOp, rhoOp, pOp, piOut, rhoOut, pOut]
-        new_map = dict(child.op_map)
-        new_map[node_idx] = {"pi": piOp, "rho": rhoOp, "p": pOp}
+        variables = child.variables + [pi_op, rho_op, p_op, pi_out, rho_out, p_out]
+        assignments = child.assignments + [
+            _OpAssignment(node_idx=node_idx, path=path, pi=pi_op, rho=rho_op, p=p_op)
+        ]
+        logger.debug(
+            "AccuracyInferenceOptimizer:   fresh op vars %s, %s, %s; "
+            "out vars %s, %s, %s; total ops so far: %d",
+            pi_op,
+            rho_op,
+            p_op,
+            pi_out,
+            rho_out,
+            p_out,
+            len(assignments),
+        )
 
         return _InferResult(
-            pi=piOut, rho=rhoOut, p=pOut,
-            constraints=new_constraints,
-            variables=new_vars,
-            op_map=new_map,
+            pi=pi_out,
+            rho=rho_out,
+            p=p_out,
+            constraints=constraints,
+            variables=variables,
+            assignments=assignments,
         )
 
     def _apply_t_prod(self, left: _InferResult, right: _InferResult) -> _InferResult:
-        piOut = self._fresh("pi_prod")
-        rhoOut = self._fresh("rho_prod")
-        pOut = self._fresh("p_prod")
+        """T-Prod for the Cartesian-product step underlying SemJoinNode.
 
-        merged_constraints = left.constraints + right.constraints + [
-            piOut == left.pi * right.pi,
-            rhoOut == left.rho * right.rho,
-            pOut == left.p * right.p,
+        The paper's full T-Prod also introduces a fresh per-product (pi, rho,
+        p). For LOTUS' join, the cross product itself is exact, and the
+        natural-language predicate's accuracy is captured by the T-Sel that
+        the caller applies immediately after. We therefore only propagate
+        ``<pi1*pi2, rho1*rho2, p1*p2>`` here and keep the operator-level
+        fresh variables on the T-Sel side.
+        """
+        pi_out = self._fresh("pi_prod")
+        rho_out = self._fresh("rho_prod")
+        p_out = self._fresh("p_prod")
+
+        constraints = left.constraints + right.constraints + [
+            pi_out == left.pi * right.pi,
+            rho_out == left.rho * right.rho,
+            p_out == left.p * right.p,
         ]
-
-        merged_vars = left.variables + right.variables + [piOut, rhoOut, pOut]
-        merged_map = {**left.op_map, **right.op_map}
-
-        return _InferResult(
-            pi=piOut, rho=rhoOut, p=pOut,
-            constraints=merged_constraints,
-            variables=merged_vars,
-            op_map=merged_map,
+        variables = left.variables + right.variables + [pi_out, rho_out, p_out]
+        assignments = left.assignments + right.assignments
+        logger.debug(
+            "AccuracyInferenceOptimizer: T-Prod merging left/right -> out vars %s, %s, %s "
+            "(cumulative ops: %d)",
+            pi_out,
+            rho_out,
+            p_out,
+            len(assignments),
         )
 
-def _solve(result: _InferResult, target_pi: float, target_rho: float, target_p: float, min_eps: float = 0.01):
-    solver = Solver()
+        return _InferResult(
+            pi=pi_out,
+            rho=rho_out,
+            p=p_out,
+            constraints=constraints,
+            variables=variables,
+            assignments=assignments,
+        )
 
-    for c in result.constraints:
-        solver.add(c)
 
-    for v in result.variables:
-        solver.add(v >= min_eps, v <= 1.0)
+# ---------------------------------------------------------------------------
+# Solver
+# ---------------------------------------------------------------------------
 
-    solver.add(result.pi == target_pi)
-    solver.add(result.rho == target_rho)
-    solver.add(result.p == target_p)
 
-    if solver.check() != sat:
+def _model_value_to_float(model: Any, var: Any) -> float:
+    val = model.eval(var, model_completion=True)
+    try:
+        return float(val.as_fraction())
+    except Exception:
+        return float(val.as_decimal(6).rstrip("?"))
+
+
+def _z3_float(value: float) -> Any:
+    from z3 import RealVal
+
+    return RealVal(str(float(value)))
+
+
+def _budget_to_target(budget: float, min_epsilon: float) -> float:
+    return min(1.0, max(min_epsilon, math.exp(-budget)))
+
+
+def _solve_uniform_z3(
+    operator_keys: Sequence[Hashable],
+    target_pi: float,
+    target_rho: float,
+    target_p: float,
+    min_epsilon: float,
+) -> Optional[dict[Hashable, AccuracyTarget]]:
+    """Allocate the product-rule budget equally across operators (cost-blind).
+
+    Used when no per-operator cost function is supplied. Each operator
+    receives the same combined error budget
+    ``(pi_i * rho_i * p_i) = (target_pi * target_rho * target_p) ** (1/N)``,
+    with a deterministic tiebreaker so the per-axis split is reproducible.
+    """
+    from z3 import Optimize, Real, RealVal, Sum, sat
+
+    max_budget = -math.log(min_epsilon)
+    optimizer = Optimize()
+    optimizer.set(priority="lex")
+
+    budgets: dict[Hashable, tuple[Any, Any, Any]] = {}
+    for idx, key in enumerate(operator_keys):
+        pi_budget = Real(f"pi_budget_{idx}")
+        rho_budget = Real(f"rho_budget_{idx}")
+        p_budget = Real(f"p_budget_{idx}")
+        for budget in (pi_budget, rho_budget, p_budget):
+            optimizer.add(budget >= RealVal("0"))
+            optimizer.add(budget <= _z3_float(max_budget))
+        budgets[key] = (pi_budget, rho_budget, p_budget)
+
+    def add_budget_constraint(metric_budgets: Sequence[Any], target: float) -> None:
+        if target <= 0.0:
+            total_budget = max_budget * len(operator_keys)
+        else:
+            total_budget = -math.log(float(target))
+        optimizer.add(Sum(metric_budgets) <= _z3_float(total_budget))
+
+    add_budget_constraint([budgets[k][0] for k in operator_keys], target_pi)
+    add_budget_constraint([budgets[k][1] for k in operator_keys], target_rho)
+    add_budget_constraint([budgets[k][2] for k in operator_keys], target_p)
+
+    combined_budgets = [
+        budgets[k][0] + budgets[k][1] + budgets[k][2] for k in operator_keys
+    ]
+    optimizer.maximize(Sum(combined_budgets))
+
+    if len(combined_budgets) > 1:
+        spread = Real("accuracy_target_spread")
+        optimizer.add(spread >= RealVal("0"))
+        for i, lhs in enumerate(combined_budgets):
+            for rhs in combined_budgets[i + 1 :]:
+                optimizer.add(spread >= lhs - rhs)
+                optimizer.add(spread >= rhs - lhs)
+        optimizer.minimize(spread)
+
+    deterministic_tiebreaker = Sum(
+        [RealVal(str(i + 1)) * budget for i, budget in enumerate(combined_budgets)]
+    )
+    optimizer.maximize(deterministic_tiebreaker)
+
+    if optimizer.check() != sat:
         return None
 
-    model = solver.model()
+    model = optimizer.model()
+    return {
+        key: AccuracyTarget(
+            pi=_budget_to_target(
+                _model_value_to_float(model, budgets[key][0]), min_epsilon
+            ),
+            rho=_budget_to_target(
+                _model_value_to_float(model, budgets[key][1]), min_epsilon
+            ),
+            p=_budget_to_target(
+                _model_value_to_float(model, budgets[key][2]), min_epsilon
+            ),
+        )
+        for key in operator_keys
+    }
 
-    def _eval(var):
-        val = model.eval(var, model_completion=True)
-        try:
-            return float(val.as_fraction())
-        except Exception:
-            return float(val.as_decimal(6).rstrip("?"))
 
-    solved = {}
-    for node_idx, var_dict in result.op_map.items():
-        solved[node_idx] = {
-            "pi": _eval(var_dict["pi"]),
-            "rho": _eval(var_dict["rho"]),
-            "p": _eval(var_dict["p"]),
+def _solve_with_cost_fn(
+    operator_keys: Sequence[Hashable],
+    target_pi: float,
+    target_rho: float,
+    target_p: float,
+    min_epsilon: float,
+    cost_fn: Callable[[Hashable, float, float, float], float],
+    *,
+    selectivity_fn: Optional[Callable[[Hashable, float, float, float], float]] = None,
+    trace_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    trace_context: Optional[Mapping[str, Any]] = None,
+) -> Optional[dict[Hashable, AccuracyTarget]]:
+    """Minimize the cascade cost under product constraints, via SLSQP in
+    log-budget space.
+
+    Objective: ``sum_i (prod_{j<i} sel_j) * cost_fn(key_i, pi_i, rho_i, p_i)``,
+    where ``sel_j = selectivity_fn(key_j, ...)`` is operator ``j``'s keep-rate
+    (fraction of rows it passes downstream). Operators are cascaded in the given
+    ``operator_keys`` order, so operator ``i`` is priced on the rows that reach
+    it (``N * prod upstream keep-rates``) rather than the full ``N``. When
+    ``selectivity_fn`` is ``None`` every keep-rate is treated as ``1`` and this
+    reduces exactly to the previous operator-local ``sum_i cost_fn`` objective.
+
+    Variables (per operator): ``b_pi_i, b_rho_i, b_p_i`` with
+    ``pi_i = exp(-b_pi_i)`` (and likewise for rho/p). Constraints are linear
+    in budgets: ``sum_i b_pi_i <= -log(target_pi)`` etc. with each
+    ``b_*_i in [0, -log(min_epsilon)]``.
+    """
+    from scipy.optimize import minimize
+
+    n = len(operator_keys)
+    max_budget = -math.log(min_epsilon)
+
+    def _target_log_budget(target: float) -> float:
+        if target <= 0.0:
+            return max_budget * n
+        return -math.log(float(min(1.0, target)))
+
+    log_pi = _target_log_budget(target_pi)
+    log_rho = _target_log_budget(target_rho)
+    log_p = _target_log_budget(target_p)
+
+    # Equal initial allocation per axis -- already feasible.
+    x0 = np.empty(3 * n, dtype=float)
+    x0[0::3] = log_pi / n
+    x0[1::3] = log_rho / n
+    x0[2::3] = log_p / n
+
+    bounds = [(0.0, max_budget)] * (3 * n)
+
+    trace_sequence = 0
+    objective_evaluation = 0
+    accepted_iteration = 0
+    trace_failed = False
+    evaluation_cache: dict[
+        bytes, tuple[int, float, list[float], list[Optional[str]]]
+    ] = {}
+
+    def _key_for_x(x: np.ndarray) -> bytes:
+        return np.ascontiguousarray(np.asarray(x, dtype=np.float64)).tobytes()
+
+    def _targets_for_x(x: np.ndarray) -> list[dict[str, Any]]:
+        targets = []
+        for i, key in enumerate(operator_keys):
+            p_i = _budget_to_target(float(x[3 * i + 2]), min_epsilon)
+            targets.append(
+                {
+                    "operator_index": i,
+                    # Operator keys in current callers are tuples/ints/strings.
+                    # ``repr`` keeps the generic Hashable API traceable even for
+                    # a caller-defined key that is not JSON serializable.
+                    "operator_key_repr": repr(key),
+                    "precision_target": _budget_to_target(
+                        float(x[3 * i]), min_epsilon
+                    ),
+                    "recall_target": _budget_to_target(
+                        float(x[3 * i + 1]), min_epsilon
+                    ),
+                    "probability_target": p_i,
+                    "estimation_confidence": min(max(p_i, 1e-9), 1.0 - 1e-9),
+                }
+            )
+        return targets
+
+    def _constraints_for_targets(
+        x: np.ndarray, targets: Sequence[Mapping[str, Any]]
+    ) -> dict[str, dict[str, float | bool]]:
+        output: dict[str, dict[str, float | bool]] = {}
+        for name, axis, cap, required, field_name in (
+            ("precision", 0, log_pi, target_pi, "precision_target"),
+            ("recall", 1, log_rho, target_rho, "recall_target"),
+            ("probability", 2, log_p, target_p, "probability_target"),
+        ):
+            used = float(np.sum(x[axis::3]))
+            product = float(math.prod(float(row[field_name]) for row in targets))
+            log_slack = float(cap - used)
+            product_slack = float(product - required)
+            output[name] = {
+                "required_product": float(required),
+                "assigned_product": product,
+                "product_slack": product_slack,
+                "log_budget_cap": float(cap),
+                "log_budget_used": used,
+                "log_budget_slack": log_slack,
+                "feasible": bool(log_slack >= -1e-7),
+            }
+        return output
+
+    def _emit_trace(
+        event: str,
+        x: np.ndarray,
+        *,
+        objective: Optional[float] = None,
+        costs: Optional[Sequence[float]] = None,
+        cost_errors: Optional[Sequence[Optional[str]]] = None,
+        **fields: Any,
+    ) -> None:
+        nonlocal trace_sequence, trace_failed
+        if trace_callback is None or trace_failed:
+            return
+        targets = _targets_for_x(x)
+        if costs is not None:
+            for row, cost, error in zip(
+                targets, costs, cost_errors or [None] * len(costs)
+            ):
+                row["objective_cost"] = float(cost)
+                row["cost_error"] = error
+        record: dict[str, Any] = {
+            "schema": "lotus.accuracy-slsqp-trace.v1",
+            "event": event,
+            "event_sequence": trace_sequence,
+            "context": dict(trace_context or {}),
+            "global_targets": {
+                "precision": float(target_pi),
+                "recall": float(target_rho),
+                "probability": float(target_p),
+            },
+            "operators": targets,
+            "objective": None if objective is None else float(objective),
+            "constraints": _constraints_for_targets(x, targets),
+            "log_budgets": [float(value) for value in np.asarray(x, dtype=float)],
+            **fields,
         }
+        trace_sequence += 1
+        try:
+            trace_callback(record)
+        except Exception:  # pragma: no cover - defensive: tracing is observational
+            # Instrumentation must never change the optimizer's selected point.
+            # Disable the failed sink for the remainder of this solve and leave a
+            # conventional log record for diagnosis.
+            trace_failed = True
+            logger.exception("Disabling failed accuracy-SLSQP trace callback")
 
-    return solved
+    def _upstream_keep_rate(key: Hashable, pi: float, rho: float, p: float) -> float:
+        """Operator keep-rate (fraction passed downstream), clamped to [0, 1]."""
+        if selectivity_fn is None:
+            return 1.0
+        try:
+            s = float(selectivity_fn(key, pi, rho, p))
+        except Exception:
+            return 1.0
+        if not math.isfinite(s):
+            return 1.0
+        return min(max(s, 0.0), 1.0)
+
+    def _evaluate_costs(
+        x: np.ndarray,
+    ) -> tuple[float, list[float], list[Optional[str]]]:
+        total = 0.0
+        costs: list[float] = []
+        cost_errors: list[Optional[str]] = []
+        cumulative = 1.0  # product of upstream keep-rates reaching operator i
+        for i, key in enumerate(operator_keys):
+            pi_i = _budget_to_target(float(x[3 * i]), min_epsilon)
+            rho_i = _budget_to_target(float(x[3 * i + 1]), min_epsilon)
+            p_i = _budget_to_target(float(x[3 * i + 2]), min_epsilon)
+            error: Optional[str] = None
+            try:
+                c = float(cost_fn(key, pi_i, rho_i, p_i))
+            except Exception as exc:
+                c = float("inf")
+                error = f"{type(exc).__name__}: {exc}"
+            if not math.isfinite(c):
+                c = 1e12
+                if error is None:
+                    error = "non-finite cost mapped to 1e12"
+            c *= cumulative  # rows reaching this operator = N * upstream keep-rates
+            costs.append(c)
+            cost_errors.append(error)
+            total += c
+            cumulative *= _upstream_keep_rate(key, pi_i, rho_i, p_i)
+        return total, costs, cost_errors
+
+    def _objective(x: np.ndarray) -> float:
+        nonlocal objective_evaluation
+        if trace_callback is None:
+            # Preserve the pre-instrumentation hot path: no target-record/list
+            # construction when tracing was not explicitly requested.
+            total = 0.0
+            cumulative = 1.0  # product of upstream keep-rates reaching operator i
+            for i, key in enumerate(operator_keys):
+                pi_i = _budget_to_target(float(x[3 * i]), min_epsilon)
+                rho_i = _budget_to_target(float(x[3 * i + 1]), min_epsilon)
+                p_i = _budget_to_target(float(x[3 * i + 2]), min_epsilon)
+                try:
+                    cost = float(cost_fn(key, pi_i, rho_i, p_i))
+                except Exception:
+                    cost = float("inf")
+                if not math.isfinite(cost):
+                    cost = 1e12
+                total += cumulative * cost
+                cumulative *= _upstream_keep_rate(key, pi_i, rho_i, p_i)
+            return total
+
+        total, costs, cost_errors = _evaluate_costs(x)
+        evaluation_index = objective_evaluation
+        objective_evaluation += 1
+        if trace_callback is not None:
+            evaluation_cache[_key_for_x(x)] = (
+                evaluation_index,
+                total,
+                costs,
+                cost_errors,
+            )
+        _emit_trace(
+            "objective_evaluation",
+            x,
+            objective=total,
+            costs=costs,
+            cost_errors=cost_errors,
+            objective_evaluation=evaluation_index,
+        )
+        return total
+
+    # Product-rule constraints translate to linear inequalities in log-budget
+    # space: ``-log(target) - sum(budgets) >= 0``. SciPy treats "ineq"
+    # constraints as ``fun(x) >= 0``.
+    constraints = [
+        {
+            "type": "ineq",
+            "fun": lambda x, axis=axis, cap=cap: cap
+            - float(np.sum(x[axis::3])),
+        }
+        for axis, cap in ((0, log_pi), (1, log_rho), (2, log_p))
+    ]
+
+    _emit_trace(
+        "solver_start",
+        x0,
+        accepted_iteration=0,
+        max_iterations=200,
+        ftol=1e-7,
+    )
+
+    def _iteration_callback(xk: np.ndarray) -> None:
+        nonlocal accepted_iteration
+        accepted_iteration += 1
+        cached = evaluation_cache.get(_key_for_x(xk))
+        if cached is None:
+            total, costs, cost_errors = _evaluate_costs(xk)
+            source_evaluation = None
+        else:
+            source_evaluation, total, costs, cost_errors = cached
+        _emit_trace(
+            "accepted_iteration",
+            xk,
+            objective=total,
+            costs=costs,
+            cost_errors=cost_errors,
+            accepted_iteration=accepted_iteration,
+            source_objective_evaluation=source_evaluation,
+        )
+
+    result = minimize(
+        _objective,
+        x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        callback=_iteration_callback if trace_callback is not None else None,
+        options={"maxiter": 200, "ftol": 1e-7, "disp": False},
+    )
+
+    if not result.success:
+        # The optimizer reached its iteration cap or got stuck on a constraint
+        # boundary. The starting point is already feasible (uniform split), so
+        # fall back to that rather than returning ``None``.
+        x_use = np.asarray(x0, dtype=float).copy()
+        selected_point_source = "uniform_fallback"
+    else:
+        x_use = np.asarray(result.x, dtype=float).copy()
+        selected_point_source = "solver_result"
+
+    # F7: the EE cost objective is piecewise-constant (discrete thresholds + min
+    # over layers), so SLSQP often gets ~0 gradient and either fails (falls back
+    # to x0) or returns a point ~= x0 -- i.e. the "cost-aware" split silently
+    # degenerates to the uniform/geometric one. Log it so a reader knows when the
+    # allocation is actually uniform (not a bug: the guarantee still holds).
+    import logging as _logging
+
+    _is_uniform = bool(
+        np.allclose(x_use, np.asarray(x0, dtype=float), rtol=0.0, atol=1e-9)
+    )
+    _logging.getLogger(__name__).info(
+        "accuracy SLSQP split: success=%s status=%s cost_aware_split_converged=%s "
+        "(returned point %s uniform x0)",
+        bool(result.success), getattr(result, "status", "?"),
+        bool(result.success) and not _is_uniform,
+        "==" if _is_uniform else "!=",
+    )
+
+    # Numerical slack on the linear constraints: SLSQP can violate by ~1e-8
+    # which then propagates into ``pi*rho*p < target`` by a similar amount.
+    # Project back onto the feasible polytope along each axis if needed.
+    x_before_projection = x_use.copy()
+    for axis, cap in ((0, log_pi), (1, log_rho), (2, log_p)):
+        s = float(np.sum(x_use[axis::3]))
+        if s > cap and s > 0.0:
+            x_use[axis::3] = x_use[axis::3] * (cap / s)
+
+    if trace_callback is not None:
+        final_objective, final_costs, final_cost_errors = _evaluate_costs(x_use)
+        scipy_fun = getattr(result, "fun", None)
+        scipy_reported_objective = (
+            float(scipy_fun)
+            if scipy_fun is not None and math.isfinite(float(scipy_fun))
+            else None
+        )
+        _emit_trace(
+            "solver_result",
+            x_use,
+            objective=final_objective,
+            costs=final_costs,
+            cost_errors=final_cost_errors,
+            success=bool(result.success),
+            status=int(getattr(result, "status", -1)),
+            message=str(getattr(result, "message", "")),
+            iterations=int(getattr(result, "nit", accepted_iteration)),
+            objective_evaluations=int(
+                getattr(result, "nfev", objective_evaluation)
+            ),
+            jacobian_evaluations=(
+                None
+                if getattr(result, "njev", None) is None
+                else int(getattr(result, "njev"))
+            ),
+            selected_point_source=selected_point_source,
+            returned_uniform=bool(
+                np.allclose(x_use, x0, rtol=0.0, atol=1e-9)
+            ),
+            projection_applied=bool(
+                not np.allclose(x_use, x_before_projection, rtol=0.0, atol=0.0)
+            ),
+            projection_max_abs_delta=float(
+                np.max(np.abs(x_use - x_before_projection))
+            ),
+            scipy_reported_objective=scipy_reported_objective,
+        )
+
+    out: dict[Hashable, AccuracyTarget] = {}
+    for i, key in enumerate(operator_keys):
+        out[key] = AccuracyTarget(
+            pi=_budget_to_target(float(x_use[3 * i]), min_epsilon),
+            rho=_budget_to_target(float(x_use[3 * i + 1]), min_epsilon),
+            p=_budget_to_target(float(x_use[3 * i + 2]), min_epsilon),
+        )
+    return out
+
+
+def solve_cost_aware_product_targets(
+    operator_keys: Sequence[Hashable],
+    target_pi: float,
+    target_rho: float,
+    target_p: float,
+    min_epsilon: float,
+    *,
+    cost_fn: Optional[Callable[[Hashable, float, float, float], float]] = None,
+    selectivity_fn: Optional[Callable[[Hashable, float, float, float], float]] = None,
+    cost_aware: bool = True,
+    trace_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    trace_context: Optional[Mapping[str, Any]] = None,
+) -> Optional[dict[Hashable, AccuracyTarget]]:
+    """Solve per-operator product-rule accuracy targets.
+
+    Implements a cascade-aware extension of the cost rule from Fig. 2 of
+    Lesani, *Accuracy Specification and Derivation for Natural Language
+    Relational Algebra* (Jan 2026):
+
+        minimize   sum_i rows_reaching_i * cost_op_i(pi_i, rho_i, p_i)
+        subject to product_i pi_i  >= target_pi
+                   product_i rho_i >= target_rho
+                   product_i p_i   >= target_p
+                   pi_i, rho_i, p_i in [min_epsilon, 1]
+
+    The product constraints are linearized in log-budget space (Sum of
+    ``-log(pi_i)`` <= ``-log(target_pi)``, etc.) and the per-operator cost
+    is supplied by ``cost_fn(key, pi, rho, p) -> float``. For cascades,
+    ``selectivity_fn`` supplies each operator's keep-rate, and the product of
+    upstream keep-rates scales the work reaching later operators. Omitting it
+    preserves the original operator-local sum exactly. ``cost_fn`` is free to
+    depend non-linearly on ``(pi, rho, p)``; common Stretto cost models (for
+    example ``c_proxy*n + c_silver*n*UnsureFraction(pi, rho)``) fit naturally.
+
+    When ``cost_fn`` is ``None`` or ``cost_aware=False``, the allocation
+    falls back to an equal-split-per-axis uniform Z3 solve, useful as a
+    cost-blind baseline. When ``trace_callback`` is supplied, cost-aware solves
+    emit a JSON-compatible record for the initial point, every objective
+    evaluation, every SLSQP callback iteration, and the final selected point.
+    ``trace_context`` is copied into every record so a caller can attach stable
+    run/query identities without coupling this generic solver to its runner.
+    """
+    if not 0.0 < min_epsilon < 1.0:
+        raise ValueError(f"min_epsilon must be in (0, 1), got {min_epsilon!r}")
+    if target_pi > 1.0 or target_rho > 1.0 or target_p > 1.0:
+        return None
+    if len(operator_keys) == 0:
+        return (
+            {}
+            if target_pi <= 1.0 and target_rho <= 1.0 and target_p <= 1.0
+            else None
+        )
+
+    if not cost_aware or cost_fn is None:
+        return _solve_uniform_z3(
+            operator_keys=operator_keys,
+            target_pi=target_pi,
+            target_rho=target_rho,
+            target_p=target_p,
+            min_epsilon=min_epsilon,
+        )
+
+    return _solve_with_cost_fn(
+        operator_keys=operator_keys,
+        target_pi=target_pi,
+        target_rho=target_rho,
+        target_p=target_p,
+        min_epsilon=min_epsilon,
+        cost_fn=cost_fn,
+        selectivity_fn=selectivity_fn,
+        trace_callback=trace_callback,
+        trace_context=trace_context,
+    )
+
+
+def _solve(
+    result: _InferResult,
+    target_pi: float,
+    target_rho: float,
+    target_p: float,
+    min_epsilon: float,
+) -> list[tuple[_OpAssignment, dict[str, float]]] | None:
+    """Solve the constraint system and return a list of solved assignments.
+
+    Returns ``None`` if the targets are infeasible (Z3 returns ``unsat``
+    or ``unknown``).
+    """
+    keys = list(range(len(result.assignments)))
+    targets = solve_cost_aware_product_targets(
+        operator_keys=keys,
+        target_pi=target_pi,
+        target_rho=target_rho,
+        target_p=target_p,
+        min_epsilon=min_epsilon,
+        cost_fn=None,
+        cost_aware=False,
+    )
+    if targets is None:
+        return None
+
+    return [
+        (
+            assignment,
+            {
+                "pi": targets[idx].pi,
+                "rho": targets[idx].rho,
+                "p": targets[idx].p,
+            },
+        )
+        for idx, assignment in enumerate(result.assignments)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+
 
 class AccuracyInferenceOptimizer(BaseOptimizer):
+    """Derives per-operator cascade accuracy targets via SMT.
+
+    Given top-level ``precision_target``, ``recall_target``, and
+    ``probability_target``, walks the AST, collects the constraints implied
+    by the typing rules in Fig. 2 of the paper, solves them with Z3, and
+    rewrites each ``SemFilterNode`` / ``SemJoinNode`` (top-level *and*
+    nested inside a join's ``right_lf``) with a fresh ``CascadeArgs`` whose
+    ``precision_target``, ``recall_target``, and ``failure_probability``
+    reflect that operator's share of the obligation.
+
+    Limitations:
+
+    * Union (``T-Union``) and difference (``T-Minus``) are not yet
+      supported.
+    * The cost term ``c`` from the paper is not modeled; any feasible
+      assignment is returned.
+    * Sharing the same node object across multiple locations in the
+      LazyFrame tree is not handled — each occurrence emits its own
+      constraints and only the last write wins on rewrite.
+
+    Requires ``z3-solver`` (``pip install z3-solver``).
+    """
+
     requires_train_data: bool = False
 
     def __init__(
@@ -208,28 +942,61 @@ class AccuracyInferenceOptimizer(BaseOptimizer):
         recall_target: float = 0.85,
         probability_target: float = 0.95,
         min_epsilon: float = 0.01,
-    ):
+    ) -> None:
+        for name, val in (
+            ("precision_target", precision_target),
+            ("recall_target", recall_target),
+            ("probability_target", probability_target),
+        ):
+            if not 0.0 < val <= 1.0:
+                raise ValueError(f"{name} must be in (0, 1], got {val!r}")
+        if not 0.0 < min_epsilon < 1.0:
+            raise ValueError(f"min_epsilon must be in (0, 1), got {min_epsilon!r}")
+
         self.precision_target = precision_target
         self.recall_target = recall_target
         self.probability_target = probability_target
         self.min_epsilon = min_epsilon
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def optimize(
         self,
-        nodes: list,
-        train_data=None,
-    ) -> list:
-        """Walk the LOTUS AST, solve for accuracy, inject CascadeArgs."""
+        nodes: list[BaseNode],
+        train_data: dict["LazyFrame", pd.DataFrame] | pd.DataFrame | None = None,
+    ) -> list[BaseNode]:
+        try:
+            import z3  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "AccuracyInferenceOptimizer requires the z3-solver package. "
+                "Install it with: pip install z3-solver"
+            ) from exc
 
-        # Step 1: Traverse and extract constraints
+        logger.info(
+            "AccuracyInferenceOptimizer: starting on %d top-level node(s) with "
+            "targets pi=%.4f, rho=%.4f, p=%.4f, min_epsilon=%.4f",
+            len(nodes),
+            self.precision_target,
+            self.recall_target,
+            self.probability_target,
+            self.min_epsilon,
+        )
         builder = _ConstraintBuilder()
-        result = builder.traverse(nodes)
+        result = builder.walk(nodes)
 
-        if not result.op_map:
+        if not result.assignments:
             logger.info("AccuracyInferenceOptimizer: no semantic operators found")
             return nodes
 
-        # Step 2: Solve with Z3
+        logger.info(
+            "AccuracyInferenceOptimizer: collected %d operator(s) and %d constraint(s); "
+            "invoking Z3",
+            len(result.assignments),
+            len(result.constraints),
+        )
         solved = _solve(
             result,
             self.precision_target,
@@ -242,127 +1009,66 @@ class AccuracyInferenceOptimizer(BaseOptimizer):
             logger.warning(
                 "AccuracyInferenceOptimizer: targets infeasible "
                 "(pi=%.2f, rho=%.2f, p=%.2f) for %d operators",
-                self.precision_target, self.recall_target,
-                self.probability_target, len(result.op_map),
+                self.precision_target,
+                self.recall_target,
+                self.probability_target,
+                len(result.assignments),
             )
             return nodes
 
-        # Step 3: Inject solved CascadeArgs into each operator node
-        updated_nodes = list(nodes)
-        for node_idx, params in solved.items():
-            node = updated_nodes[node_idx]
+        return self._apply_solved(nodes, solved)
 
-            cascade_update = {
-                "precision_target": params["pi"],
-                "recall_target": params["rho"],
-                "failure_probability": 1.0 - params["p"],
-            }
+    # ------------------------------------------------------------------
+    # Rewrite
+    # ------------------------------------------------------------------
 
-            if hasattr(node, 'cascade_args') and node.cascade_args is not None:
-                new_args = node.cascade_args.model_copy(update=cascade_update)
-            else:
-                new_args = CascadeArgs(**cascade_update)
+    def _apply_solved(
+        self,
+        nodes: list[BaseNode],
+        solved: list[tuple[_OpAssignment, dict[str, float]]],
+    ) -> list[BaseNode]:
+        """Apply solved (pi, rho, p) values back into the AST.
 
-            updated_nodes[node_idx] = node.model_copy(
-                update={"cascade_args": new_args}
-            )
+        Groups by ``path`` and delegates the recursion / parent-LazyFrame
+        reconstruction to :func:`rewrite_by_path`.
+        """
+        by_path: dict[PathToLF, list[tuple[_OpAssignment, dict[str, float]]]] = defaultdict(list)
+        for assignment, params in solved:
+            by_path[assignment.path].append((assignment, params))
 
-            sig = getattr(node, 'signature', lambda: f"node[{node_idx}]")
-            logger.info(
-                "AccuracyInferenceOptimizer: %s -> pi=%.4f, rho=%.4f, p=%.4f",
-                sig(), params["pi"], params["rho"], params["p"],
-            )
+        def apply(nodes_at_path: list[BaseNode], path: PathToLF) -> list[BaseNode]:
+            for assignment, params in by_path.get(path, ()):
+                nodes_at_path[assignment.node_idx] = self._inject(
+                    nodes_at_path[assignment.node_idx], params
+                )
+            return nodes_at_path
 
-        return updated_nodes
+        return rewrite_by_path(nodes, by_path.keys(), apply)
 
-def _demo():
-    print("=" * 65)
-    print("  AccuracyInferenceOptimizer — Standalone Demo")
-    print("=" * 65)
+    def _inject(self, node: BaseNode, params: dict[str, float]) -> BaseNode:
+        cascade_update = {
+            "precision_target": params["pi"],
+            "recall_target": params["rho"],
+            # CascadeArgs encodes failure probability rather than the paper's
+            # success probability p; clamp to handle Z3's decimal truncation
+            # that can put p marginally above 1.
+            "failure_probability": max(0.0, 1.0 - params["p"]),
+        }
 
-    # --- Demo 1: Chain of 3 semantic filters ---
-    print("\n── Demo 1: Chain of 3 sem_filters ──")
-    print("   Pipeline: source → sem_filter('AI') → sem_filter('2023') → sem_filter('cited')")
-    print("   Target: π=0.80, ρ=0.70, p=0.90\n")
+        existing = getattr(node, "cascade_args", None)
+        new_args = (
+            existing.model_copy(update=cascade_update)
+            if existing is not None
+            else CascadeArgs(**cascade_update)
+        )
 
-    if LOTUS_AVAILABLE:
-        nodes = [SourceNode(), SemFilterNode(user_instruction="about AI"), SemFilterNode(user_instruction="from 2023"), SemFilterNode(user_instruction="highly cited")]
-    else:
-        nodes = [SourceNode(), SemFilterNode(), SemFilterNode(), SemFilterNode()]
+        sig = getattr(node, "signature", lambda: f"<{type(node).__name__}>")
+        logger.info(
+            "AccuracyInferenceOptimizer: %s -> pi=%.4f, rho=%.4f, p=%.4f",
+            sig(),
+            params["pi"],
+            params["rho"],
+            params["p"],
+        )
 
-    builder = _ConstraintBuilder()
-    result = builder.traverse(nodes)
-
-    solved = _solve(result, 0.80, 0.70, 0.90)
-    if solved:
-        check_pi, check_rho, check_p = 1.0, 1.0, 1.0
-        for idx, params in sorted(solved.items()):
-            print(f"   Node {idx} (sem_filter): π={params['pi']:.4f}, "
-                  f"ρ={params['rho']:.4f}, p={params['p']:.4f}")
-            print(f"     → CascadeArgs(precision_target={params['pi']:.4f}, "
-                  f"recall_target={params['rho']:.4f}, "
-                  f"failure_probability={1-params['p']:.4f})")
-            check_pi *= params["pi"]
-            check_rho *= params["rho"]
-            check_p *= params["p"]
-        print(f"\n   Verification: π={check_pi:.4f} (target 0.80), "
-              f"ρ={check_rho:.4f} (target 0.70), p={check_p:.4f} (target 0.90)")
-    else:
-        print("   UNSAT — targets infeasible")
-
-    # --- Demo 2: Two filters (simpler case) ---
-    print("\n── Demo 2: Chain of 2 sem_filters ──")
-    print("   Pipeline: source → sem_filter('lawsuits') → sem_filter('2023')")
-    print("   Target: π=0.90, ρ=0.85, p=0.95\n")
-
-    nodes2 = [SourceNode(), SemFilterNode(user_instruction="about lawsuits"), SemFilterNode(user_instruction="from 2023")]
-    builder2 = _ConstraintBuilder()
-    result2 = builder2.traverse(nodes2)
-    solved2 = _solve(result2, 0.90, 0.85, 0.95)
-    if solved2:
-        check_pi, check_rho = 1.0, 1.0
-        for idx, params in sorted(solved2.items()):
-            print(f"   Node {idx} (sem_filter): π={params['pi']:.4f}, "
-                  f"ρ={params['rho']:.4f}, p={params['p']:.4f}")
-            check_pi *= params["pi"]
-            check_rho *= params["rho"]
-        print(f"\n   Verification: π={check_pi:.4f} (target 0.90), "
-              f"ρ={check_rho:.4f} (target 0.85)")
-
-    # --- Demo 3: Single filter ---
-    print("\n── Demo 3: Single sem_filter ──")
-    print("   Pipeline: source → sem_filter('about lawsuits')")
-    print("   Target: π=0.90, ρ=0.85, p=0.95\n")
-
-    nodes3 = [SourceNode(), SemFilterNode(user_instruction="about lawsuits")]
-    builder3 = _ConstraintBuilder()
-    result3 = builder3.traverse(nodes3)
-    solved3 = _solve(result3, 0.90, 0.85, 0.95)
-    if solved3:
-        for idx, params in sorted(solved3.items()):
-            print(f"   Node {idx} (sem_filter): π={params['pi']:.4f}, "
-                  f"ρ={params['rho']:.4f}, p={params['p']:.4f}")
-
-    # --- Demo 4: Comparison with even-split ---
-    print("\n── Demo 4: SMT vs Even-Split (5 operators) ──")
-    print("   Target: π=0.75, ρ=0.60, p=0.85\n")
-
-    nodes4 = [SourceNode()] + [SemFilterNode(user_instruction=f"filter_{i}") for i in range(5)]
-    builder4 = _ConstraintBuilder()
-    result4 = builder4.traverse(nodes4)
-    solved4 = _solve(result4, 0.75, 0.60, 0.85)
-
-    n = 5
-    even_pi = 0.75 ** (1.0 / n)
-    even_rho = 0.60 ** (1.0 / n)
-
-    print(f"   Even-split: every operator gets π={even_pi:.4f}, ρ={even_rho:.4f}")
-    print()
-    if solved4:
-        check_pi = 1.0
-        for idx, params in sorted(solved4.items()):
-            print(f"   SMT Node {idx}: π={params['pi']:.4f}, ρ={params['rho']:.4f}")
-            check_pi *= params["pi"]
-
-if __name__ == "__main__":
-    _demo()
+        return node.model_copy(update={"cascade_args": new_args})

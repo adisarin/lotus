@@ -31,6 +31,10 @@ from ..nodes import (
 )
 from .base import BaseOptimizer
 
+# Re-exported for backwards compatibility — these utilities live in
+# ``optimizer.utils`` so they can be shared with other optimizers.
+from .utils import PathEntry, PathToLF, rewrite_by_path
+
 if TYPE_CHECKING:
     from gepa.optimize_anything import GEPAConfig
 
@@ -55,130 +59,13 @@ DEFAULT_OPTIMIZABLE_PARAMS: dict[type, frozenset[str]] = {
 UserEvalFn = Callable[..., "float | tuple[float, dict[str, Any]]"]
 
 
-# ---------------------------------------------------------------------------
-# PathEntry — navigation to nested LazyFrames
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class PathEntry:
-    """One step in the path from a parent lazyframe to a nested LazyFrame.
-
-    Addresses a LazyFrame at ``getattr(node, field_name)`` navigated
-    further by ``sub_path``.  When ``sub_path`` is empty the field itself
-    is the LazyFrame (e.g. a join's ``right_lf``).  When non-empty the
-    sub-path indexes into a nested list/tuple/dict structure (e.g. a
-    ``PandasOpNode.lf_args["key"]`` or ``ApplyFnNode.args[0][1]``).
-    """
-
-    node_idx: int
-    field_name: str = field(default="")
-    sub_path: tuple[Any, ...] = field(default=())
-
-    # -- navigation --------------------------------------------------------
-
-    def get_lf(self, node: BaseNode) -> "LazyFrame | None":
-        """Extract the nested LazyFrame from *node*."""
-        from ..lazyframe import LazyFrame
-
-        root = getattr(node, self.field_name, None)
-        if root is None:
-            return None
-        current = root
-        for key in self.sub_path:
-            if isinstance(current, (list, tuple)):
-                if not isinstance(key, int) or key < 0 or key >= len(current):
-                    return None
-                current = current[key]
-            elif isinstance(current, dict):
-                if key not in current:
-                    return None
-                current = current[key]
-            else:
-                return None
-        return current if isinstance(current, LazyFrame) else None
-
-    def set_lf(self, node: BaseNode, new_lf: "LazyFrame") -> BaseNode:
-        """Return a copy of *node* with the nested LazyFrame replaced."""
-        if not self.sub_path:
-            return node.model_copy(update={self.field_name: new_lf})
-        root = getattr(node, self.field_name)
-        updated = self._set_nested(root, self.sub_path, new_lf)
-        return node.model_copy(update={self.field_name: updated})
-
-    # -- nested-structure utilities ----------------------------------------
-
-    @staticmethod
-    def _get_nested(value: Any, path: tuple[Any, ...]) -> Any | None:
-        """Navigate a nested list/tuple/dict and return the leaf value."""
-        current = value
-        for key in path:
-            if isinstance(current, (list, tuple)):
-                if not isinstance(key, int) or key < 0 or key >= len(current):
-                    return None
-                current = current[key]
-            elif isinstance(current, dict):
-                if key not in current:
-                    return None
-                current = current[key]
-            else:
-                return None
-        return current
-
-    @staticmethod
-    def _set_nested(value: Any, path: tuple[Any, ...], replacement: Any) -> Any:
-        """Return a shallow copy of *value* with the leaf at *path* replaced."""
-        if not path:
-            return replacement
-
-        key, rest = path[0], path[1:]
-
-        if isinstance(value, (list, tuple)):
-            if not isinstance(key, int) or key < 0 or key >= len(value):
-                return value
-            items = list(value)
-            items[key] = PathEntry._set_nested(items[key], rest, replacement)
-            return type(value)(items) if isinstance(value, tuple) else items
-
-        if isinstance(value, dict):
-            if key not in value:
-                return value
-            return {k: (PathEntry._set_nested(v, rest, replacement) if k == key else v) for k, v in value.items()}
-
-        return value
-
-    # -- collection --------------------------------------------------------
-
-    @staticmethod
-    def collect(node: BaseNode, node_idx: int) -> "list[tuple[PathEntry, LazyFrame]]":
-        """Collect all nested LazyFrame refs from a single node."""
-        from ..lazyframe import LazyFrame
-
-        if isinstance(node, SourceNode):
-            return []
-
-        results: list[tuple[PathEntry, LazyFrame]] = []
-
-        def _scan(value: Any, fname: str, sp: tuple[Any, ...]) -> None:
-            if isinstance(value, LazyFrame):
-                results.append((PathEntry(node_idx, fname, sp), value))
-            elif isinstance(value, (list, tuple)):
-                for idx, item in enumerate(value):
-                    _scan(item, fname, sp + (idx,))
-            elif isinstance(value, dict):
-                for k, item in value.items():
-                    _scan(item, fname, sp + (k,))
-
-        for fname in type(node).model_fields:
-            root = getattr(node, fname, None)
-            if root is not None:
-                _scan(root, fname, ())
-
-        return results
-
-
-# Convenience alias
-PathToLF = tuple[PathEntry, ...]
+__all__ = [
+    "DEFAULT_OPTIMIZABLE_PARAMS",
+    "GEPAOptimizer",
+    "PathEntry",
+    "PathToLF",
+    "UserEvalFn",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -469,8 +356,11 @@ class GEPAOptimizer(BaseOptimizer):
     ) -> list[BaseNode]:
         """Create a new node list with candidate values applied.
 
-        Groups targets by ``path`` and applies updates recursively
-        from deepest to shallowest.
+        Groups targets by ``path``, then delegates the recursion and
+        parent-LazyFrame reconstruction to :func:`rewrite_by_path`. The
+        path-local apply callback is responsible for preserving shared-node
+        identity via ``applied_nodes`` (so a node referenced from multiple
+        paths becomes the **same** updated Python object everywhere).
         """
         allowed_candidate_keys = {t.candidate_key for t in targets}
         occurrences = self._collect_target_occurrences(nodes)
@@ -484,8 +374,45 @@ class GEPAOptimizer(BaseOptimizer):
         # node tree through in-node state updates or nested LazyFrame paths.
         copied_nodes = deepcopy(nodes)
         self._restore_source_refs(nodes, copied_nodes)
-        new_nodes = self._apply_at_path(copied_nodes, candidate, by_path, ())
-        return new_nodes
+
+        # Maps id(original_node) -> updated node. Shared across the whole
+        # recursion so duplicate references resolve to the same instance,
+        # which downstream optimizers like CascadeOptimizer rely on.
+        applied_nodes: dict[int, BaseNode] = {}
+
+        def apply(nodes_at_path: list[BaseNode], path: PathToLF) -> list[BaseNode]:
+            # Capture original ids before any swap — these are what the
+            # registry is keyed on.
+            original_ids = [id(n) for n in nodes_at_path]
+
+            # Replace any nodes that were already updated at a different path.
+            for idx, oid in enumerate(original_ids):
+                if oid in applied_nodes:
+                    nodes_at_path[idx] = applied_nodes[oid]
+
+            # Group the candidate updates targeting nodes at this path.
+            updates_by_node: dict[int, list[tuple[str, Any]]] = defaultdict(list)
+            for t in by_path.get(path, ()):
+                value = candidate.get(t.candidate_key)
+                if value is None:
+                    continue
+                parsed_value = json.loads(value) if t.is_json_encoded else value
+                updates_by_node[t.node_idx].append((t.param_name, parsed_value))
+
+            for idx, updates in updates_by_node.items():
+                oid = original_ids[idx]
+                if oid in applied_nodes:
+                    nodes_at_path[idx] = applied_nodes[oid]
+                    continue
+                updated_node = nodes_at_path[idx]
+                for param_name, param_value in updates:
+                    updated_node = updated_node.apply_optimizable_param_value(param_name, param_value)
+                applied_nodes[oid] = updated_node
+                nodes_at_path[idx] = updated_node
+
+            return nodes_at_path
+
+        return rewrite_by_path(copied_nodes, by_path.keys(), apply)
 
     def _restore_source_refs(self, original_nodes: list[BaseNode], copied_nodes: list[BaseNode]) -> None:
         """Restore SourceNode.lazyframe_ref identity after deepcopy.
@@ -511,74 +438,6 @@ class GEPAOptimizer(BaseOptimizer):
                 if copied_lf is None:
                     continue
                 self._restore_source_refs(original_lf._nodes, copied_lf._nodes)
-
-    def _apply_at_path(
-        self,
-        nodes: list[BaseNode],
-        candidate: dict[str, str],
-        by_path: dict[PathToLF, list[_OptTarget]],
-        path: PathToLF,
-        *,
-        _applied_nodes: dict[int, BaseNode] | None = None,
-    ) -> list[BaseNode]:
-        """Recursively apply candidate values at a given lazyframe path.
-
-        ``_applied_nodes`` maps ``id(original_node) → updated_node`` across
-        all recursive calls so that nodes shared between the main pipeline
-        and nested LazyFrames (e.g. after ``deepcopy``) remain the **same**
-        Python object after updates.  This preserves identity for downstream
-        optimizers like ``CascadeOptimizer`` which mutate
-        nodes in-place.
-        """
-        from ..lazyframe import LazyFrame
-
-        if _applied_nodes is None:
-            _applied_nodes = {}
-
-        patched = list(nodes)
-
-        # Replace any nodes that were already updated at a different path
-        for idx in range(len(patched)):
-            orig_id = id(patched[idx])
-            if orig_id in _applied_nodes:
-                patched[idx] = _applied_nodes[orig_id]
-
-        # Direct parameter updates for targets at this path
-        updates_by_node: dict[int, list[tuple[str, Any]]] = defaultdict(list)
-        for t in by_path.get(path, []):
-            value = candidate.get(t.candidate_key)
-            if value is None:
-                continue
-            parsed_value = json.loads(value) if t.is_json_encoded else value
-            updates_by_node[t.node_idx].append((t.param_name, parsed_value))
-
-        for idx, updates in updates_by_node.items():
-            orig_id = id(nodes[idx])
-            if orig_id in _applied_nodes:
-                # Already updated via a shared reference at another path
-                patched[idx] = _applied_nodes[orig_id]
-            else:
-                updated_node = patched[idx]
-                for param_name, param_value in updates:
-                    updated_node = updated_node.apply_optimizable_param_value(param_name, param_value)
-                _applied_nodes[orig_id] = updated_node
-                patched[idx] = updated_node
-
-        # Recurse into child paths
-        for child_path in by_path:
-            if len(child_path) != len(path) + 1 or child_path[: len(path)] != path:
-                continue
-
-            entry = child_path[-1]
-            nested_lf = entry.get_lf(patched[entry.node_idx])
-            if nested_lf is not None:
-                new_nodes = self._apply_at_path(
-                    nested_lf._nodes, candidate, by_path, child_path, _applied_nodes=_applied_nodes
-                )
-                new_lf = LazyFrame(_nodes=new_nodes, _source=nested_lf._source)
-                patched[entry.node_idx] = entry.set_lf(patched[entry.node_idx], new_lf)
-
-        return patched
 
     # ------------------------------------------------------------------
     # LazyFrame description (for GEPA objective / background)
