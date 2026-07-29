@@ -431,11 +431,20 @@ def _solve_with_cost_fn(
     min_epsilon: float,
     cost_fn: Callable[[Hashable, float, float, float], float],
     *,
+    selectivity_fn: Optional[Callable[[Hashable, float, float, float], float]] = None,
     trace_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     trace_context: Optional[Mapping[str, Any]] = None,
 ) -> Optional[dict[Hashable, AccuracyTarget]]:
-    """Minimize ``sum_i cost_fn(key_i, pi_i, rho_i, p_i)`` under product
-    constraints, via SLSQP in log-budget space.
+    """Minimize the cascade cost under product constraints, via SLSQP in
+    log-budget space.
+
+    Objective: ``sum_i (prod_{j<i} sel_j) * cost_fn(key_i, pi_i, rho_i, p_i)``,
+    where ``sel_j = selectivity_fn(key_j, ...)`` is operator ``j``'s keep-rate
+    (fraction of rows it passes downstream). Operators are cascaded in the given
+    ``operator_keys`` order, so operator ``i`` is priced on the rows that reach
+    it (``N * prod upstream keep-rates``) rather than the full ``N``. When
+    ``selectivity_fn`` is ``None`` every keep-rate is treated as ``1`` and this
+    reduces exactly to the previous operator-local ``sum_i cost_fn`` objective.
 
     Variables (per operator): ``b_pi_i, b_rho_i, b_p_i`` with
     ``pi_i = exp(-b_pi_i)`` (and likewise for rho/p). Constraints are linear
@@ -567,12 +576,25 @@ def _solve_with_cost_fn(
             trace_failed = True
             logger.exception("Disabling failed accuracy-SLSQP trace callback")
 
+    def _upstream_keep_rate(key: Hashable, pi: float, rho: float, p: float) -> float:
+        """Operator keep-rate (fraction passed downstream), clamped to [0, 1]."""
+        if selectivity_fn is None:
+            return 1.0
+        try:
+            s = float(selectivity_fn(key, pi, rho, p))
+        except Exception:
+            return 1.0
+        if not math.isfinite(s):
+            return 1.0
+        return min(max(s, 0.0), 1.0)
+
     def _evaluate_costs(
         x: np.ndarray,
     ) -> tuple[float, list[float], list[Optional[str]]]:
         total = 0.0
         costs: list[float] = []
         cost_errors: list[Optional[str]] = []
+        cumulative = 1.0  # product of upstream keep-rates reaching operator i
         for i, key in enumerate(operator_keys):
             pi_i = _budget_to_target(float(x[3 * i]), min_epsilon)
             rho_i = _budget_to_target(float(x[3 * i + 1]), min_epsilon)
@@ -587,9 +609,11 @@ def _solve_with_cost_fn(
                 c = 1e12
                 if error is None:
                     error = "non-finite cost mapped to 1e12"
+            c *= cumulative  # rows reaching this operator = N * upstream keep-rates
             costs.append(c)
             cost_errors.append(error)
             total += c
+            cumulative *= _upstream_keep_rate(key, pi_i, rho_i, p_i)
         return total, costs, cost_errors
 
     def _objective(x: np.ndarray) -> float:
@@ -598,6 +622,7 @@ def _solve_with_cost_fn(
             # Preserve the pre-instrumentation hot path: no target-record/list
             # construction when tracing was not explicitly requested.
             total = 0.0
+            cumulative = 1.0  # product of upstream keep-rates reaching operator i
             for i, key in enumerate(operator_keys):
                 pi_i = _budget_to_target(float(x[3 * i]), min_epsilon)
                 rho_i = _budget_to_target(float(x[3 * i + 1]), min_epsilon)
@@ -608,7 +633,8 @@ def _solve_with_cost_fn(
                     cost = float("inf")
                 if not math.isfinite(cost):
                     cost = 1e12
-                total += cost
+                total += cumulative * cost
+                cumulative *= _upstream_keep_rate(key, pi_i, rho_i, p_i)
             return total
 
         total, costs, cost_errors = _evaluate_costs(x)
@@ -774,16 +800,18 @@ def solve_cost_aware_product_targets(
     min_epsilon: float,
     *,
     cost_fn: Optional[Callable[[Hashable, float, float, float], float]] = None,
+    selectivity_fn: Optional[Callable[[Hashable, float, float, float], float]] = None,
     cost_aware: bool = True,
     trace_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     trace_context: Optional[Mapping[str, Any]] = None,
 ) -> Optional[dict[Hashable, AccuracyTarget]]:
     """Solve per-operator product-rule accuracy targets.
 
-    Implements the cost rule from Fig. 2 of Lesani, *Accuracy Specification
-    and Derivation for Natural Language Relational Algebra* (Jan 2026):
+    Implements a cascade-aware extension of the cost rule from Fig. 2 of
+    Lesani, *Accuracy Specification and Derivation for Natural Language
+    Relational Algebra* (Jan 2026):
 
-        minimize   sum_i cost_op_i(pi_i, rho_i, p_i)
+        minimize   sum_i rows_reaching_i * cost_op_i(pi_i, rho_i, p_i)
         subject to product_i pi_i  >= target_pi
                    product_i rho_i >= target_rho
                    product_i p_i   >= target_p
@@ -791,10 +819,12 @@ def solve_cost_aware_product_targets(
 
     The product constraints are linearized in log-budget space (Sum of
     ``-log(pi_i)`` <= ``-log(target_pi)``, etc.) and the per-operator cost
-    is supplied by ``cost_fn(key, pi, rho, p) -> float``. ``cost_fn`` is
-    free to depend non-linearly on ``(pi, rho, p)``; common Stretto cost
-    models (e.g. ``c_proxy*n + c_silver*n*UnsureFraction(pi, rho)``) fit
-    naturally.
+    is supplied by ``cost_fn(key, pi, rho, p) -> float``. For cascades,
+    ``selectivity_fn`` supplies each operator's keep-rate, and the product of
+    upstream keep-rates scales the work reaching later operators. Omitting it
+    preserves the original operator-local sum exactly. ``cost_fn`` is free to
+    depend non-linearly on ``(pi, rho, p)``; common Stretto cost models (for
+    example ``c_proxy*n + c_silver*n*UnsureFraction(pi, rho)``) fit naturally.
 
     When ``cost_fn`` is ``None`` or ``cost_aware=False``, the allocation
     falls back to an equal-split-per-axis uniform Z3 solve, useful as a
@@ -831,6 +861,7 @@ def solve_cost_aware_product_targets(
         target_p=target_p,
         min_epsilon=min_epsilon,
         cost_fn=cost_fn,
+        selectivity_fn=selectivity_fn,
         trace_callback=trace_callback,
         trace_context=trace_context,
     )

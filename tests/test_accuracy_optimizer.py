@@ -3,11 +3,12 @@
 The solver in :mod:`lotus.ast.optimizer.accuracy_optimizer` lives behind a
 single helper, ``solve_cost_aware_product_targets``. Per Fig. 2 of the
 spec (Lesani, *Accuracy Specification and Derivation for Natural Language
-Relational Algebra*, Jan 2026), the solver minimizes
-``sum_i cost_fn(key_i, pi_i, rho_i, p_i)`` subject to the product-rule
-constraints (``Pi_i pi_i >= target_pi`` etc.) with per-axis budget
-linearization. When ``cost_fn`` is omitted, the solver falls back to an
-equal-split-per-axis uniform allocation.
+Relational Algebra*, Jan 2026), the solver minimizes a cascade-aware sum in
+which each operator cost is scaled by the product of upstream keep-rates,
+subject to the product-rule constraints (``Pi_i pi_i >= target_pi`` etc.) with
+per-axis budget linearization. Omitting ``selectivity_fn`` preserves the
+operator-local sum; omitting ``cost_fn`` falls back to an equal-split-per-axis
+uniform allocation.
 
 These tests cover:
 
@@ -295,6 +296,39 @@ def test_cost_aware_with_equal_weights_gives_uniform_combined_budget():
         assert combined == pytest.approx(expected_combined, abs=NUMERICAL_TOL)
 
     _check_product_meets_global(cost_aware, keys, PI, RHO, P)
+
+
+def test_cost_aware_objective_scales_downstream_by_upstream_keep_rate():
+    records = []
+    solve_cost_aware_product_targets(
+        operator_keys=["op0", "op1"],
+        target_pi=0.5,
+        target_rho=0.5,
+        target_p=0.5,
+        min_epsilon=1e-3,
+        cost_fn=lambda key, pi, rho, p: 10.0 if key == "op0" else 20.0,
+        selectivity_fn=lambda key, pi, rho, p: 0.5,
+        trace_callback=records.append,
+    )
+    record = next(row for row in records if row["event"] == "objective_evaluation")
+    assert [row["objective_cost"] for row in record["operators"]] == [10.0, 10.0]
+    assert record["objective"] == pytest.approx(20.0)
+
+
+def test_cost_aware_objective_without_selectivity_is_operator_local():
+    records = []
+    solve_cost_aware_product_targets(
+        operator_keys=["op0", "op1"],
+        target_pi=0.5,
+        target_rho=0.5,
+        target_p=0.5,
+        min_epsilon=1e-3,
+        cost_fn=lambda key, pi, rho, p: 10.0 if key == "op0" else 20.0,
+        trace_callback=records.append,
+    )
+    record = next(row for row in records if row["event"] == "objective_evaluation")
+    assert [row["objective_cost"] for row in record["operators"]] == [10.0, 20.0]
+    assert record["objective"] == pytest.approx(30.0)
 
 
 def test_cost_aware_loosens_expensive_op_and_tightens_cheap_op():
